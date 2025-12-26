@@ -1,105 +1,192 @@
 #include <Arduino.h>
 
-#define BUTTON_PIN 2
-#define LED_PIN 10
+const int buttonPin = 2;
+const int ledPin = 10; 
 
-volatile unsigned long pressStartTime = 0;
-volatile uint8_t shortPressCount = 0;
-volatile int blinkHalfPeriod = 0; // Time in ms for half a blink cycle
+const unsigned long SHORT_PRESS_TIME = 1500; // Max duration for a "Short" press
+const unsigned long LONG_PRESS_TIME = 4000; // Threshold between "Long" and "Very Long"
+const unsigned long DEBOUNCE_TIME = 50;   // Noise suppression for button ISR
 
-// Function Declarations
-void startBlinking(uint8_t count);
-void stopSystem();
-void handleButtonISR();
+volatile int PressCounter = 0; // Stores number of short presses
+volatile unsigned long pressTime = 0; // Timestamp of button press start
+volatile unsigned long lastISRTime = 0; // For software debouncing
+volatile unsigned long lastDuration = 0; // Stores duration of the last released press
+volatile bool actionShort = false; // Flag: Short press detected
+volatile bool actionStart = false; // Flag: Long press detected (Confirm)
+volatile bool actionStop = false; // Flag: Very long press detected (Off)
 
-// Main Functions
+bool Blink            = false; // System status: currently blinking or not
+bool feedbackLedOn    = false; // Status of the 200ms visual feedback flash
+unsigned long lastFlashStart = 0; // Timestamp to track feedback flash duration
 
-void setup() {
-    // Setup button and LED to Arduino's GPIOs
-    pinMode(BUTTON_PIN, INPUT);
-    pinMode(LED_PIN, OUTPUT);
-    
-    // On button state change, activate handleButtonISR
-    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonISR, CHANGE);
+/**
+ * buttonISR: External Interrupt Service Routine
+ * Triggered on CHANGE (Pin 2). Measures high-pulse duration to classify press types.
+ */
+void buttonISR()
+{
+    unsigned long now = millis();
+    if (now - lastISRTime < DEBOUNCE_TIME) { return; }
+    lastISRTime = now;
 
-    // Initialize timer
+    if (digitalRead(buttonPin) == HIGH)
+    { 
+        // Button Pressed: record start time
+        pressTime = now;
+    } 
+    else
+    { 
+        // Button Released: calculate duration
+        unsigned long duration = now - pressTime;
+        lastDuration = duration;
 
-    // Don't allow interrupts while setting Timer0
+        if (duration < SHORT_PRESS_TIME)
+        {
+            // Classify as Short Press
+            if (!Blink)
+            { 
+                PressCounter++;
+                actionShort = true; 
+            }
+        } 
+        else if (duration < LONG_PRESS_TIME)
+        {
+            // Classify as Long Press (1.5s - 4.0s)
+            actionStart = true; 
+        } 
+        else
+        {
+            // Classify as Very Long Press (> 4.0s)
+            actionStop = true;  
+        }
+    }
+}
+
+/**
+ * Timer1 Compare Match ISR
+ * Toggles the LED state based on hardware timer frequency.
+ */
+ISR(TIMER1_COMPA_vect)
+{
+    if (Blink) 
+    {
+        digitalWrite(ledPin, !digitalRead(ledPin)); 
+    }
+}
+
+/**
+ * startTimer: Configures Timer1 in CTC Mode
+ * @param counts: Number of 500ms increments.
+ * Sets the OCR1A register based on 16MHz clock and 1024 prescaler.
+ */
+void startTimer(int counts)
+{
+    if (counts <= 0) counts = 1;
+
     noInterrupts();
-
-    // Clear TImer0 Control Registers
     TCCR1A = 0; 
     TCCR1B = 0; 
-    TCNT1  = 0;
+    TCNT1 = 0;
 
-    // Reconfigure Timer0 Control Registers
+    // Formula: OCR1A = (16MHz / (prescaler * toggle_frequency)) - 1
+    // 7812 ticks = 0.5 seconds at 1024 prescaler.
+    OCR1A = (7812 * counts) - 1;
 
-    // Set CTC mode - reset timer when hitting the value in "OCR1A" register
-    TCCR1B |= (1 << WGM12); 
+    // WGM12 = CTC Mode, CS12/CS10 = 1024 Prescaler
+    TCCR1B |= (1 << WGM12) | (1 << CS12) | (1 << CS10);
+    
     // Enable Timer Compare Interrupt
-    TIMSK1 |= (1 << OCIE1A); 
-
-    // Reallow interrupts 
+    TIMSK1 |= (1 << OCIE1A);
     interrupts();
 }
 
-void loop() {}
-
-
-// Helper Functions
-
-
-// ISR for the Button
-void handleButtonISR()
+/**
+ * stopTimer: Completely disables Timer1 and resets system state
+ * Ensures the LED is physically LOW and registers are cleared.
+ */
+void stopTimer()
 {
-    if (digitalRead(BUTTON_PIN) == HIGH) // Button press
+    noInterrupts();
+    TIMSK1 &= ~(1 << OCIE1A); // Disable timer interrupt
+    TCCR1B = 0; // Stop clock
+    TCCR1A = 0; // Reset control
+    TCNT1  = 0; // Reset counter
+    
+    digitalWrite(ledPin, LOW); 
+    PressCounter  = 0;
+    Blink         = false;
+    feedbackLedOn = false; 
+    interrupts();
+}
+
+/**
+ * setup: Standard Arduino initialization
+ */
+void setup()
+{
+    Serial.begin(9600);
+    Serial.println("System Ready. Wiring: Pin 2 (Button), Pin 10 (LED).");
+    
+    pinMode(buttonPin, INPUT);
+    pinMode(ledPin, OUTPUT);
+    digitalWrite(ledPin, LOW);
+
+    // Attach External Interrupt to Pin 2
+    attachInterrupt(digitalPinToInterrupt(buttonPin), buttonISR, CHANGE);
+}
+
+/**
+ * loop: Main execution thread
+ * Processes flags raised by the ISR and manages Serial communication.
+ */
+void loop()
+{
+    // --- Process OFF Event ---
+    if (actionStop)
     {
-        pressStartTime = millis(); // Create timestamp on button press
+        actionStop = false; 
+        actionStart = false; // Prevent accidental start after stop
+        Serial.print("OFF: Press duration ");
+        Serial.print(lastDuration);
+        Serial.println("ms. System Shutdown.");
+        stopTimer();
     }
-    else // Button released
+
+    // --- Process SHORT PRESS Event ---
+    if (actionShort)
     {
-        unsigned long duration = millis() - pressStartTime; // Calculate time diff between press and release
+        actionShort = false;
+        Serial.print("SHORT PRESS: Counter = ");
+        Serial.println(PressCounter);
         
-        if (duration < 1500) // Short press
-        {
-            shortPressCount++;
+        digitalWrite(ledPin, HIGH); // Start 200ms feedback
+        feedbackLedOn = true;
+        lastFlashStart = millis();
+    }
+
+    // --- Manage Feedback Flash Timeout ---
+    if (feedbackLedOn && (millis() - lastFlashStart >= 200))
+    {
+        digitalWrite(ledPin, LOW);
+        feedbackLedOn = false;
+    }
+
+    // --- Process START/CONFIRM Event ---
+    if (actionStart)
+    {
+        actionStart = false;
+
+        if (!Blink && PressCounter > 0)
+        {      
+            Serial.print("CONFIRMED: Blinking every ");
+            Serial.print(PressCounter);
+            Serial.println(" seconds.");
+            Blink = true;
+            startTimer(PressCounter);
         }
-        else if (duration >= 1500 && duration <= 4000) // Long press
+        else if (!Blink && PressCounter == 0)
         {
-            startBlinking(shortPressCount);
-        }
-        else // Really long press, more than 4 Seconds
-        {
-            stopSystem();
+            Serial.println("ERROR: No counts recorded.");
         }
     }
-}
-
-// ISR for the Timer (This handles the actual blinking)
-ISR(TIMER1_COMPA_vect)
-{
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Flip LED state, HIGH->LOW\LOW->HIGH
-}
-
-void startBlinking(uint8_t count)
-{
-    if (count == 0) return;
-    
-    // Calculate blinking time duration
-    long intervalMs = count * 500;
-    
-    // Configure Timer1 Compare Match value based on intervalMs
-    // formula: OCR1A = (16MHz / (Prescaler * TargetFrequency)) - 1
-    // For 1024 prescaler: OCR1A = (15625 * intervalSeconds) - 1
-    OCR1A = (15625 * intervalMs / 1000) - 1;
-    
-    // Start Timer with 1024 prescaler
-    TCCR1B |= (1 << CS12) | (1 << CS10);
-}
-
-void stopSystem()
-{
-    TCCR1B &= ~((1 << CS12) | (1 << CS11) | (1 << CS10)); // Stop clock
-    digitalWrite(LED_PIN, LOW);
-    shortPressCount = 0;
 }
