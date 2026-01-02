@@ -1,174 +1,75 @@
-/**
- * @file ESP32.ino
- * @brief ESP32 I2C Master with WiFi and Web Server
- * 
- * This application implements an ESP32 that:
- * - Connects to WiFi in Station mode
- * - Communicates with Arduino Nano via I2C (Master role)
- * - Hosts an HTTP web server with user interface
- * - Manages humidity sensor data with min/max tracking
- * - Allows sending messages to Nano via web interface
- * 
- * @author Embedded Systems Course
- * @date 2026
- */
+// ESP32 UART Interface with WiFi and Web Server
+// Communicates with Arduino Nano via UART for humidity data
+// Hosts web server for UI and message/reset control
 
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Wire.h>
-#include <EEPROM.h>
 
-// ============================================================================
 // CONFIGURATION PARAMETERS
-// ============================================================================
 
-/** @defgroup WiFi_Config WiFi Configuration
- *  @{
- */
-#define SSID "YOUR_SSID"              ///< WiFi network SSID
-#define PASSWORD "YOUR_PASSWORD"      ///< WiFi network password
-/** @} */
+#define SSID "YOUR_SSID"
+#define PASSWORD "YOUR_PASSWORD"
+#define SERVER_PORT 80
+#define UART_BAUD 115200
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
 
-/** @defgroup I2C_Config I2C Configuration
- *  @{
- */
-#define I2C_SDA_PIN 21                ///< I2C SDA pin on ESP32
-#define I2C_SCL_PIN 22                ///< I2C SCL pin on ESP32
-#define NANO_I2C_ADDRESS 0x08         ///< I2C address of Arduino Nano
-#define I2C_FREQUENCY 100000          ///< I2C clock frequency in Hz
-/** @} */
-
-/** @defgroup Server_Config Web Server Configuration
- *  @{
- */
-#define SERVER_PORT 80                ///< HTTP server port
-/** @} */
-
-/** @defgroup EEPROM_Config EEPROM Configuration
- *  @{
- */
-#define EEPROM_SIZE 512               ///< EEPROM size in bytes
-#define EEPROM_ADDR_MIN_HUMIDITY 0    ///< EEPROM address for minimum humidity
-#define EEPROM_ADDR_MAX_HUMIDITY 4    ///< EEPROM address for maximum humidity
-/** @} */
-
-// ============================================================================
 // GLOBAL VARIABLES
-// ============================================================================
 
-WebServer server(SERVER_PORT);        ///< Web server instance
+WebServer server(SERVER_PORT);
+HardwareSerial nanoSerial(2);
 
-/** @struct SensorData
- *  @brief Structure to hold sensor readings
- */
 struct SensorData {
-  float humidity;                     ///< Current humidity reading
-  float minHumidity;                  ///< Minimum humidity recorded
-  float maxHumidity;                  ///< Maximum humidity recorded
-} sensorData = {0.0, 100.0, 0.0};
+  float humidity;
+  float minHumidity;
+  float maxHumidity;
+} sensorData = {0.0, 0.0, 0.0};
 
-bool wifiConnected = false;           ///< WiFi connection status flag
+bool wifiConnected = false;
 
-// ============================================================================
 // FUNCTION DECLARATIONS
-// ============================================================================
 
 void setupWiFi(void);
-void setupI2C(void);
 void setupWebServer(void);
-void requestDataFromNano(void);
-void updateSensorMinMax(float humidity);
-void saveSensorDataToEEPROM(void);
-void loadSensorDataFromEEPROM(void);
+bool uartRequestStatus(float &h, float &mn, float &mx);
+void uartSendReset(void);
+void uartSendMessage(const String &msg);
+bool parseStatusLine(const String &line, float &h, float &mn, float &mx);
 void handleRoot(void);
 void handleReset(void);
 void handleSendMessage(void);
 void handleGetStatus(void);
 
-// ============================================================================
-// SETUP AND LOOP
-// ============================================================================
 
-/**
- * @brief Arduino setup function - called once at startup
- * 
- * Initializes:
- * - Serial communication (for debugging)
- * - EEPROM storage
- * - WiFi connection
- * - I2C communication
- * - Web server with routes
- */
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n\n=== ESP32 I2C Master with Web Server ===");
+  Serial.println("\n=== ESP32 UART Interface ===");
   
-  // Initialize EEPROM
-  EEPROM.begin(EEPROM_SIZE);
-  loadSensorDataFromEEPROM();
+  nanoSerial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  Serial.println("[UART] Initialized");
   
-  Serial.println("[SETUP] EEPROM initialized");
-  Serial.printf("[SETUP] Loaded min humidity: %.2f, max humidity: %.2f\n", 
-                sensorData.minHumidity, sensorData.maxHumidity);
-  
-  // Setup WiFi
   setupWiFi();
-  
-  // Setup I2C
-  setupI2C();
-  
-  // Setup Web Server
   setupWebServer();
   
   server.begin();
-  Serial.println("[SETUP] Web server started on port " + String(SERVER_PORT));
+  Serial.println("[SETUP] Web server started");
 }
 
-/**
- * @brief Arduino loop function - called repeatedly
- * 
- * Handles:
- * - Web server client requests
- * - Periodic I2C data requests from Nano
- * - WiFi reconnection if needed
- */
 void loop() {
   server.handleClient();
-  
-  // Request data from Nano every 2 seconds
-  static unsigned long lastRequest = 0;
-  if (millis() - lastRequest > 2000) {
-    requestDataFromNano();
-    lastRequest = millis();
-  }
-  
-  // Check WiFi connection
-  if (!wifiConnected && WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WIFI] Reconnecting to WiFi...");
-    setupWiFi();
-  }
-  
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
   delay(10);
 }
 
-// ============================================================================
-// WiFi SETUP
-// ============================================================================
+// WIFI SETUP
 
-/**
- * @brief Initializes WiFi connection in Station mode
- * 
- * Attempts to connect to the specified SSID with the given password.
- * Prints connection status to Serial.
- */
 void setupWiFi(void) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASSWORD);
   
-  Serial.print("[WIFI] Connecting to ");
-  Serial.println(SSID);
+  Serial.print("[WIFI] Connecting to "); Serial.println(SSID);
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -180,157 +81,90 @@ void setupWiFi(void) {
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
     Serial.println("\n[WIFI] Connected!");
-    Serial.print("[WIFI] IP address: ");
-    Serial.println(WiFi.localIP());
+    Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP());
   } else {
     wifiConnected = false;
-    Serial.println("\n[WIFI] Connection failed");
+    Serial.println("\n[WIFI] Failed");
   }
 }
 
-// ============================================================================
-// I2C SETUP AND COMMUNICATION
-// ============================================================================
+// UART COMMUNICATION
 
-/**
- * @brief Initializes I2C communication as Master
- * 
- * Configures pins and frequency for I2C Master mode.
- */
-void setupI2C(void) {
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(I2C_FREQUENCY);
-  Serial.println("[I2C] Initialized as Master");
-  Serial.printf("[I2C] SDA: %d, SCL: %d, Frequency: %d Hz\n", 
-                I2C_SDA_PIN, I2C_SCL_PIN, I2C_FREQUENCY);
+bool parseStatusLine(const String &line, float &h, float &mn, float &mx) {
+  int posH = line.indexOf("H=");
+  int posMIN = line.indexOf("MIN=");
+  int posMAX = line.indexOf("MAX=");
+  
+  if (posH == -1 || posMIN == -1 || posMAX == -1) return false;
+  
+  int endH = line.indexOf(';', posH);
+  h = line.substring(posH + 2, endH).toFloat();
+  
+  int endMIN = line.indexOf(';', posMIN);
+  mn = line.substring(posMIN + 4, endMIN).toFloat();
+  
+  mx = line.substring(posMAX + 4).toFloat();
+  return true;
 }
 
-/**
- * @brief Requests humidity data from Arduino Nano via I2C
- * 
- * Sends an I2C request to the Nano, receives humidity data,
- * updates min/max values, and saves to EEPROM if changed.
- */
-void requestDataFromNano(void) {
-  Wire.requestFrom(NANO_I2C_ADDRESS, 4); // Request 4 bytes (float)
+bool uartRequestStatus(float &h, float &mn, float &mx) {
+  while (nanoSerial.available()) nanoSerial.read();
   
-  if (Wire.available() == 4) {
-    byte buffer[4];
-    for (int i = 0; i < 4; i++) {
-      buffer[i] = Wire.read();
+  nanoSerial.print("GET\n");
+  
+  unsigned long startTime = millis();
+  String response = "";
+  bool gotNewline = false;
+  
+  while (millis() - startTime < 500) {
+    if (nanoSerial.available()) {
+      char c = nanoSerial.read();
+      if (c == '\n') {
+        gotNewline = true;
+        break;
+      }
+      response += c;
     }
-    
-    // Convert bytes to float
-    float* humidityPtr = (float*)buffer;
-    sensorData.humidity = *humidityPtr;
-    
-    updateSensorMinMax(sensorData.humidity);
-    
-    Serial.printf("[I2C] Received humidity: %.2f%%, Min: %.2f%%, Max: %.2f%%\n",
-                  sensorData.humidity, sensorData.minHumidity, sensorData.maxHumidity);
-  } else {
-    Serial.println("[I2C] Failed to receive data from Nano");
-  }
-}
-
-/**
- * @brief Updates minimum and maximum humidity values
- * 
- * @param humidity Current humidity reading from sensor
- * 
- * Updates the min/max values if the current reading exceeds
- * previous extremes. Saves updated values to EEPROM.
- */
-void updateSensorMinMax(float humidity) {
-  bool changed = false;
-  
-  if (humidity < sensorData.minHumidity) {
-    sensorData.minHumidity = humidity;
-    changed = true;
   }
   
-  if (humidity > sensorData.maxHumidity) {
-    sensorData.maxHumidity = humidity;
-    changed = true;
+  if (!gotNewline) {
+    Serial.println("[UART] Timeout");
+    return false;
   }
   
-  if (changed) {
-    saveSensorDataToEEPROM();
+  if (parseStatusLine(response, h, mn, mx)) {
+    Serial.printf("[UART] H=%.1f MIN=%.1f MAX=%.1f\n", h, mn, mx);
+    return true;
   }
-}
-
-// ============================================================================
-// EEPROM OPERATIONS
-// ============================================================================
-
-/**
- * @brief Saves sensor min/max values to EEPROM
- * 
- * Stores minimum and maximum humidity values as floats (4 bytes each)
- * at predefined EEPROM addresses for persistent storage.
- */
-void saveSensorDataToEEPROM(void) {
-  EEPROM.writeFloat(EEPROM_ADDR_MIN_HUMIDITY, sensorData.minHumidity);
-  EEPROM.writeFloat(EEPROM_ADDR_MAX_HUMIDITY, sensorData.maxHumidity);
-  EEPROM.commit();
-  Serial.println("[EEPROM] Sensor data saved");
-}
-
-/**
- * @brief Loads sensor min/max values from EEPROM
- * 
- * Reads minimum and maximum humidity values from EEPROM.
- * Initializes with defaults if EEPROM is empty or corrupted.
- */
-void loadSensorDataFromEEPROM(void) {
-  sensorData.minHumidity = EEPROM.readFloat(EEPROM_ADDR_MIN_HUMIDITY);
-  sensorData.maxHumidity = EEPROM.readFloat(EEPROM_ADDR_MAX_HUMIDITY);
   
-  // Validate values
-  if (isnan(sensorData.minHumidity) || sensorData.minHumidity < 0) {
-    sensorData.minHumidity = 100.0;
-  }
-  if (isnan(sensorData.maxHumidity) || sensorData.maxHumidity < 0) {
-    sensorData.maxHumidity = 0.0;
-  }
+  Serial.printf("[UART] Parse failed: %s\n", response.c_str());
+  return false;
 }
 
-// ============================================================================
+void uartSendReset(void) {
+  nanoSerial.print("RESET\n");
+  Serial.println("[UART] Reset sent");
+}
+
+void uartSendMessage(const String &msg) {
+  String truncated = msg.substring(0, 20);
+  nanoSerial.print("MSG:");
+  nanoSerial.print(truncated);
+  nanoSerial.print("\n");
+  Serial.printf("[UART] MSG: %s\n", truncated.c_str());
+}
+
 // WEB SERVER SETUP
-// ============================================================================
 
-/**
- * @brief Initializes web server routes and handlers
- * 
- * Registers HTTP endpoints:
- * - GET / : Serves HTML web interface
- * - GET /status : Returns JSON with sensor data
- * - POST /reset : Resets min/max values
- * - POST /message : Sends message to Nano
- */
 void setupWebServer(void) {
   server.on("/", handleRoot);
   server.on("/status", handleGetStatus);
   server.on("/reset", handleReset);
   server.on("/message", handleSendMessage);
-  
-  Serial.println("[SERVER] Routes registered");
 }
 
-// ============================================================================
 // HTTP REQUEST HANDLERS
-// ============================================================================
 
-/**
- * @brief Handles HTTP GET / request - serves HTML web interface
- * 
- * Returns a complete HTML page with:
- * - Real-time humidity display
- * - Min/max humidity values
- * - Text input for LCD messages
- * - Reset and Send buttons
- * - Auto-refresh functionality
- */
 void handleRoot(void) {
   String html = R"=====(
 <!DOCTYPE html>
@@ -489,10 +323,6 @@ void handleRoot(void) {
   </div>
 
   <script>
-    /**
-     * Fetches sensor data from ESP32 via /status endpoint
-     * Updates UI with current, min, and max humidity values
-     */
     function updateStatus() {
       fetch('/status')
         .then(response => response.json())
@@ -513,17 +343,13 @@ void handleRoot(void) {
             wifiStatus.className = 'status disconnected';
           }
         })
-        .catch(error => console.log('Error fetching status:', error));
+        .catch(error => console.log('Error:', error));
     }
 
-    /**
-     * Sends a message to the Arduino Nano via I2C
-     * Message will be displayed on the LCD
-     */
     function sendMessage() {
       const message = document.getElementById('message').value;
       if (message.trim() === '') {
-        alert('Please enter a message');
+        alert('Enter message');
         return;
       }
 
@@ -535,33 +361,27 @@ void handleRoot(void) {
       .then(response => response.json())
       .then(data => {
         if (data.success) {
-          alert('Message sent to LCD!');
+          alert('Sent!');
           document.getElementById('message').value = '';
-        } else {
-          alert('Failed to send message');
         }
       })
-      .catch(error => console.log('Error sending message:', error));
+      .catch(error => console.log('Error:', error));
     }
 
-    /**
-     * Resets the minimum and maximum humidity values
-     */
     function resetMinMax() {
-      if (confirm('Are you sure you want to reset min/max values?')) {
+      if (confirm('Reset min/max values?')) {
         fetch('/reset', { method: 'POST' })
           .then(response => response.json())
           .then(data => {
             if (data.success) {
-              alert('Min/Max values reset!');
+              alert('Reset!');
               updateStatus();
             }
           })
-          .catch(error => console.log('Error resetting values:', error));
+          .catch(error => console.log('Error:', error));
       }
     }
 
-    // Update status every 2 seconds
     updateStatus();
     setInterval(updateStatus, 2000);
   </script>
@@ -571,60 +391,39 @@ void handleRoot(void) {
   
   server.sendHeader("Content-Type", "text/html; charset=UTF-8");
   server.send(200, "text/html", html);
-  Serial.println("[SERVER] Root page served");
 }
 
-/**
- * @brief Handles HTTP GET /status request - returns sensor data as JSON
- * 
- * Response JSON:
- * @code
- * {
- *   "humidity": <float>,
- *   "minHumidity": <float>,
- *   "maxHumidity": <float>,
- *   "wifiConnected": <bool>
- * }
- * @endcode
- */
 void handleGetStatus(void) {
+  float h = sensorData.humidity;
+  float mn = sensorData.minHumidity;
+  float mx = sensorData.maxHumidity;
+  bool ok = uartRequestStatus(h, mn, mx);
+  
+  if (ok) {
+    sensorData.humidity = h;
+    sensorData.minHumidity = mn;
+    sensorData.maxHumidity = mx;
+  }
+  
   String json = "{";
   json += "\"humidity\":" + String(sensorData.humidity, 2) + ",";
   json += "\"minHumidity\":" + String(sensorData.minHumidity, 2) + ",";
   json += "\"maxHumidity\":" + String(sensorData.maxHumidity, 2) + ",";
-  json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false");
+  json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
+  json += "\"nanoOk\":" + String(ok ? "true" : "false");
   json += "}";
   
   server.sendHeader("Content-Type", "application/json");
   server.send(200, "application/json", json);
 }
 
-/**
- * @brief Handles HTTP POST /reset request - resets min/max humidity values
- * 
- * Resets minHumidity to 100% and maxHumidity to 0%,
- * saves changes to EEPROM, and sends confirmation to client.
- */
 void handleReset(void) {
-  sensorData.minHumidity = 100.0;
-  sensorData.maxHumidity = 0.0;
-  saveSensorDataToEEPROM();
-  
-  Serial.println("[SERVER] Min/Max values reset");
-  
+  uartSendReset();
   String json = "{\"success\":true}";
   server.sendHeader("Content-Type", "application/json");
   server.send(200, "application/json", json);
 }
 
-/**
- * @brief Handles HTTP POST /message request - sends message to Nano via I2C
- * 
- * Receives a message from the web interface and transmits it to the
- * Arduino Nano via I2C for display on the LCD.
- * 
- * Expected POST parameter: msg (max 20 characters)
- */
 void handleSendMessage(void) {
   if (!server.hasArg("msg")) {
     server.send(400, "application/json", "{\"success\":false}");
@@ -632,18 +431,7 @@ void handleSendMessage(void) {
   }
   
   String message = server.arg("msg");
-  message = message.substring(0, 20); // Limit to 20 chars
-  
-  // Send message to Nano via I2C
-  Wire.beginTransmission(NANO_I2C_ADDRESS);
-  Wire.write('M'); // Command: Message
-  Wire.write(message.length());
-  for (int i = 0; i < message.length(); i++) {
-    Wire.write(message[i]);
-  }
-  Wire.endTransmission();
-  
-  Serial.printf("[I2C] Message sent to Nano: %s\n", message.c_str());
+  uartSendMessage(message);
   
   String json = "{\"success\":true}";
   server.sendHeader("Content-Type", "application/json");
