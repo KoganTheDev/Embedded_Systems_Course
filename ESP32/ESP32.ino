@@ -26,6 +26,16 @@ struct SensorData {
 } sensorData = {0.0, 0.0, 0.0};
 
 bool wifiConnected = false;
+unsigned long lastNanoOkMillis = 0;
+int uartFailCount = 0;
+bool everGotData = false;
+unsigned long lastReconnectAttempt = 0;
+int wifiReconnectAttempts = 0;
+const unsigned long STALE_DATA_THRESHOLD = 5000;
+const unsigned long RECONNECT_INTERVAL = 10000;
+const int MAX_UART_FAIL_COUNT = 3;
+const int MAX_UART_FAIL_COUNT_CAP = 1000;
+const int MAX_RECONNECT_ATTEMPTS = 6;
 
 // FUNCTION DECLARATIONS
 
@@ -60,6 +70,63 @@ void setup() {
 void loop() {
   server.handleClient();
   wifiConnected = (WiFi.status() == WL_CONNECTED);
+  
+  // Auto-reconnect WiFi with proper debouncing and retry logic
+  if (!wifiConnected && (millis() - lastReconnectAttempt >= RECONNECT_INTERVAL)) {
+    lastReconnectAttempt = millis();
+    wifiReconnectAttempts++;
+    
+    Serial.printf("[WIFI] Attempting reconnect... (attempt %d)\n", wifiReconnectAttempts);
+    
+    // If too many reconnect attempts fail, do a full reset
+    if (wifiReconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      Serial.println("[WIFI] Too many reconnect attempts, doing full reset...");
+      WiFi.disconnect(true); // Turn off WiFi
+      delay(100);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(SSID, PASSWORD);
+      wifiReconnectAttempts = 0;
+      lastReconnectAttempt = millis();  // Reset timer to prevent immediate retry
+    } else {
+      WiFi.reconnect();
+    }
+  }
+  
+  // Reset counter on successful connection
+  if (wifiConnected && wifiReconnectAttempts > 0) {
+    wifiReconnectAttempts = 0;
+  }
+  
+  // Log successful connection once
+  static bool connectedLogged = false;
+  if (wifiConnected && !connectedLogged) {
+    connectedLogged = true;
+    Serial.println("[WIFI] Connected!");
+    Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP());
+  }
+  if (!wifiConnected) {
+    connectedLogged = false;
+  }
+  
+  // Periodic UART polling (non-blocking relative to network)
+  static unsigned long lastUartPoll = 0;
+  if (millis() - lastUartPoll >= 1000) {
+    lastUartPoll = millis();
+    float h, mn, mx;
+    if (uartRequestStatus(h, mn, mx)) {
+      sensorData.humidity = h;
+      sensorData.minHumidity = mn;
+      sensorData.maxHumidity = mx;
+      lastNanoOkMillis = millis();
+      everGotData = true;
+      uartFailCount = 0;
+    } else {
+      if (uartFailCount < MAX_UART_FAIL_COUNT_CAP) {
+        uartFailCount++;
+      }
+    }
+  }
+  
   delay(10);
 }
 
@@ -70,22 +137,10 @@ void setupWiFi(void) {
   WiFi.begin(SSID, PASSWORD);
   
   Serial.print("[WIFI] Connecting to "); Serial.println(SSID);
+  Serial.println("[WIFI] Use loop() for non-blocking connection");
   
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.println("\n[WIFI] Connected!");
-    Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP());
-  } else {
-    wifiConnected = false;
-    Serial.println("\n[WIFI] Failed");
-  }
+  // Allow immediate reconnect attempt if needed
+  lastReconnectAttempt = millis() - RECONNECT_INTERVAL;
 }
 
 // UART COMMUNICATION
@@ -98,11 +153,14 @@ bool parseStatusLine(const String &line, float &h, float &mn, float &mx) {
   if (posH == -1 || posMIN == -1 || posMAX == -1) return false;
   
   int endH = line.indexOf(';', posH);
+  if (endH == -1) return false;
   h = line.substring(posH + 2, endH).toFloat();
   
   int endMIN = line.indexOf(';', posMIN);
+  if (endMIN == -1) return false;
   mn = line.substring(posMIN + 4, endMIN).toFloat();
   
+  if (posMAX >= (int)line.length()) return false;
   mx = line.substring(posMAX + 4).toFloat();
   return true;
 }
@@ -116,7 +174,7 @@ bool uartRequestStatus(float &h, float &mn, float &mx) {
   String response = "";
   bool gotNewline = false;
   
-  while (millis() - startTime < 500) {
+  while (millis() - startTime < 200) {  // Reduced from 500ms to 200ms
     if (nanoSerial.available()) {
       char c = nanoSerial.read();
       if (c == '\n') {
@@ -161,6 +219,11 @@ void setupWebServer(void) {
   server.on("/status", handleGetStatus);
   server.on("/reset", handleReset);
   server.on("/message", handleSendMessage);
+  
+  // Handle 404
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found");
+  });
 }
 
 // HTTP REQUEST HANDLERS
@@ -294,15 +357,15 @@ void handleRoot(void) {
     <div class="sensor-data">
       <div class="data-card">
         <div class="data-label">Current Humidity</div>
-        <div class="data-value" id="humidity">-<span class="unit">%</span></div>
+        <div class="data-value"><span id="humidity">-</span><span class="unit">%</span></div>
       </div>
       <div class="data-card">
         <div class="data-label">Max Humidity</div>
-        <div class="data-value" id="maxHumidity">-<span class="unit">%</span></div>
+        <div class="data-value"><span id="maxHumidity">-</span><span class="unit">%</span></div>
       </div>
       <div class="data-card">
         <div class="data-label">Min Humidity</div>
-        <div class="data-value" id="minHumidity">-<span class="unit">%</span></div>
+        <div class="data-value"><span id="minHumidity">-</span><span class="unit">%</span></div>
       </div>
       <div class="data-card">
         <div class="data-label">Last Update</div>
@@ -327,21 +390,26 @@ void handleRoot(void) {
       fetch('/status')
         .then(response => response.json())
         .then(data => {
-          document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
-          document.getElementById('maxHumidity').textContent = data.maxHumidity.toFixed(1) + '%';
-          document.getElementById('minHumidity').textContent = data.minHumidity.toFixed(1) + '%';
+          document.getElementById('humidity').textContent = data.humidity.toFixed(1);
+          document.getElementById('maxHumidity').textContent = data.maxHumidity.toFixed(1);
+          document.getElementById('minHumidity').textContent = data.minHumidity.toFixed(1);
           
           const now = new Date();
           document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
           
           const wifiStatus = document.getElementById('wifiStatus');
+          let statusMsg = '';
           if (data.wifiConnected) {
-            wifiStatus.textContent = '✓ WiFi Connected';
+            statusMsg = '✓ WiFi Connected';
             wifiStatus.className = 'status connected';
           } else {
-            wifiStatus.textContent = '✗ WiFi Disconnected';
+            statusMsg = '✗ WiFi Disconnected';
             wifiStatus.className = 'status disconnected';
           }
+          if (data.dataStale) {
+            statusMsg += ' | ⚠️ Data Stale (UART failures: ' + data.uartFailCount + ')';
+          }
+          wifiStatus.textContent = statusMsg;
         })
         .catch(error => console.log('Error:', error));
     }
@@ -394,23 +462,23 @@ void handleRoot(void) {
 }
 
 void handleGetStatus(void) {
+  // Snapshot sensorData to avoid race condition
   float h = sensorData.humidity;
   float mn = sensorData.minHumidity;
   float mx = sensorData.maxHumidity;
-  bool ok = uartRequestStatus(h, mn, mx);
   
-  if (ok) {
-    sensorData.humidity = h;
-    sensorData.minHumidity = mn;
-    sensorData.maxHumidity = mx;
-  }
+  // Determine stale state
+  bool dataStale = (everGotData && (millis() - lastNanoOkMillis > STALE_DATA_THRESHOLD));
+  bool uartHealthy = (uartFailCount < MAX_UART_FAIL_COUNT);
   
   String json = "{";
-  json += "\"humidity\":" + String(sensorData.humidity, 2) + ",";
-  json += "\"minHumidity\":" + String(sensorData.minHumidity, 2) + ",";
-  json += "\"maxHumidity\":" + String(sensorData.maxHumidity, 2) + ",";
+  json += "\"humidity\":" + String(h, 2) + ",";
+  json += "\"minHumidity\":" + String(mn, 2) + ",";
+  json += "\"maxHumidity\":" + String(mx, 2) + ",";
   json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
-  json += "\"nanoOk\":" + String(ok ? "true" : "false");
+  json += "\"uartHealthy\":" + String(uartHealthy ? "true" : "false") + ",";
+  json += "\"dataStale\":" + String(dataStale ? "true" : "false") + ",";
+  json += "\"uartFailCount\":" + String(uartFailCount);
   json += "}";
   
   server.sendHeader("Content-Type", "application/json");
@@ -418,22 +486,34 @@ void handleGetStatus(void) {
 }
 
 void handleReset(void) {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"success\":false,\"error\":\"Method Not Allowed\"}");
+    return;
+  }
+  
   uartSendReset();
-  String json = "{\"success\":true}";
+  bool uartHealthy = (uartFailCount < MAX_UART_FAIL_COUNT);
+  String json = "{\"success\":true,\"queued\":true,\"uartHealthy\":" + String(uartHealthy ? "true" : "false") + "}";
   server.sendHeader("Content-Type", "application/json");
   server.send(200, "application/json", json);
 }
 
 void handleSendMessage(void) {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "application/json", "{\"success\":false,\"error\":\"Method Not Allowed\"}");
+    return;
+  }
+  
   if (!server.hasArg("msg")) {
-    server.send(400, "application/json", "{\"success\":false}");
+    server.send(400, "application/json", "{\"success\":false,\"error\":\"Missing msg parameter\"}");
     return;
   }
   
   String message = server.arg("msg");
   uartSendMessage(message);
   
-  String json = "{\"success\":true}";
+  bool uartHealthy = (uartFailCount < MAX_UART_FAIL_COUNT);
+  String json = "{\"success\":true,\"queued\":true,\"uartHealthy\":" + String(uartHealthy ? "true" : "false") + "}";
   server.sendHeader("Content-Type", "application/json");
   server.send(200, "application/json", json);
 }
