@@ -1,439 +1,189 @@
-// ESP32 UART Interface with WiFi and Web Server
-// Communicates with Arduino Nano via UART for humidity data
-// Hosts web server for UI and message/reset control
+/**
+ * @file WROVER_Web_Hub.ino
+ * @brief ESP32 WROVER Web Server with Professional Serial Debugging.
+ */
 
 #include <WiFi.h>
 #include <WebServer.h>
 
-// CONFIGURATION PARAMETERS
+// --- HARDWARE & NETWORK CONSTANTS ---
+const uint16_t MONITOR_BAUD  = 9600; // Increased for cleaner debug output
+const uint16_t NANO_BAUD     = 9600;
+const uint8_t  PIN_NANO_RX   = 27;
+const uint8_t  PIN_NANO_TX   = 14;
 
-#define SSID "YOUR_SSID"
-#define PASSWORD "YOUR_PASSWORD"
-#define SERVER_PORT 80
-#define UART_BAUD 115200
-#define UART_RX_PIN 16
-#define UART_TX_PIN 17
+const char* WIFI_SSID        = "SSID";
+const char* WIFI_PASS        = "Password";
 
-// GLOBAL VARIABLES
+// --- GLOBAL STATE ---
+WebServer server(80);
 
-WebServer server(SERVER_PORT);
-HardwareSerial nanoSerial(2);
+float currentHum = 0.0;
+float minHum     = 100.0;
+float maxHum     = 0.0;
 
-struct SensorData {
-  float humidity;
-  float minHumidity;
-  float maxHumidity;
-} sensorData = {0.0, 0.0, 0.0};
-
-bool wifiConnected = false;
-
-// FUNCTION DECLARATIONS
-
-void setupWiFi(void);
-void setupWebServer(void);
-bool uartRequestStatus(float &h, float &mn, float &mx);
-void uartSendReset(void);
-void uartSendMessage(const String &msg);
-bool parseStatusLine(const String &line, float &h, float &mn, float &mx);
-void handleRoot(void);
-void handleReset(void);
-void handleSendMessage(void);
-void handleGetStatus(void);
-
-
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  
-  Serial.println("\n=== ESP32 UART Interface ===");
-  
-  nanoSerial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  Serial.println("[UART] Initialized");
-  
-  setupWiFi();
-  setupWebServer();
-  
-  server.begin();
-  Serial.println("[SETUP] Web server started");
-}
-
-void loop() {
-  server.handleClient();
-  wifiConnected = (WiFi.status() == WL_CONNECTED);
-  delay(10);
-}
-
-// WIFI SETUP
-
-void setupWiFi(void) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID, PASSWORD);
-  
-  Serial.print("[WIFI] Connecting to "); Serial.println(SSID);
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnected = true;
-    Serial.println("\n[WIFI] Connected!");
-    Serial.print("[WIFI] IP: "); Serial.println(WiFi.localIP());
-  } else {
-    wifiConnected = false;
-    Serial.println("\n[WIFI] Failed");
-  }
-}
-
-// UART COMMUNICATION
-
-bool parseStatusLine(const String &line, float &h, float &mn, float &mx) {
-  int posH = line.indexOf("H=");
-  int posMIN = line.indexOf("MIN=");
-  int posMAX = line.indexOf("MAX=");
-  
-  if (posH == -1 || posMIN == -1 || posMAX == -1) return false;
-  
-  int endH = line.indexOf(';', posH);
-  h = line.substring(posH + 2, endH).toFloat();
-  
-  int endMIN = line.indexOf(';', posMIN);
-  mn = line.substring(posMIN + 4, endMIN).toFloat();
-  
-  mx = line.substring(posMAX + 4).toFloat();
-  return true;
-}
-
-bool uartRequestStatus(float &h, float &mn, float &mx) {
-  while (nanoSerial.available()) nanoSerial.read();
-  
-  nanoSerial.print("GET\n");
-  
-  unsigned long startTime = millis();
-  String response = "";
-  bool gotNewline = false;
-  
-  while (millis() - startTime < 500) {
-    if (nanoSerial.available()) {
-      char c = nanoSerial.read();
-      if (c == '\n') {
-        gotNewline = true;
-        break;
-      }
-      response += c;
-    }
-  }
-  
-  if (!gotNewline) {
-    Serial.println("[UART] Timeout");
-    return false;
-  }
-  
-  if (parseStatusLine(response, h, mn, mx)) {
-    Serial.printf("[UART] H=%.1f MIN=%.1f MAX=%.1f\n", h, mn, mx);
-    return true;
-  }
-  
-  Serial.printf("[UART] Parse failed: %s\n", response.c_str());
-  return false;
-}
-
-void uartSendReset(void) {
-  nanoSerial.print("RESET\n");
-  Serial.println("[UART] Reset sent");
-}
-
-void uartSendMessage(const String &msg) {
-  String truncated = msg.substring(0, 20);
-  nanoSerial.print("MSG:");
-  nanoSerial.print(truncated);
-  nanoSerial.print("\n");
-  Serial.printf("[UART] MSG: %s\n", truncated.c_str());
-}
-
-// WEB SERVER SETUP
-
-void setupWebServer(void) {
-  server.on("/", handleRoot);
-  server.on("/status", handleGetStatus);
-  server.on("/reset", handleReset);
-  server.on("/message", handleSendMessage);
-}
-
-// HTTP REQUEST HANDLERS
-
-void handleRoot(void) {
-  String html = R"=====(
+// --- HTML INTERFACE (No changes to your working UI) ---
+const char INDEX_HTML[] PROGMEM = R"=====(
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 Humidity Monitor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { 
-      font-family: Arial, sans-serif; 
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
-    }
-    .container { 
-      max-width: 600px; 
-      margin: 0 auto; 
-      background: white;
-      border-radius: 15px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-      padding: 30px;
-    }
-    h1 { 
-      color: #333; 
-      margin-bottom: 30px;
-      text-align: center;
-      border-bottom: 3px solid #667eea;
-      padding-bottom: 15px;
-    }
-    .sensor-data { 
-      display: grid; 
-      grid-template-columns: 1fr 1fr; 
-      gap: 20px;
-      margin-bottom: 30px;
-    }
-    .data-card { 
-      background: #f8f9fa;
-      padding: 20px;
-      border-radius: 10px;
-      border-left: 4px solid #667eea;
-    }
-    .data-label { 
-      color: #666; 
-      font-size: 14px;
-      margin-bottom: 8px;
-    }
-    .data-value { 
-      font-size: 32px; 
-      font-weight: bold;
-      color: #667eea;
-    }
-    .unit {
-      font-size: 16px;
-      color: #999;
-    }
-    .controls {
-      display: grid;
-      gap: 15px;
-      margin-bottom: 30px;
-    }
-    input[type="text"] {
-      width: 100%;
-      padding: 12px;
-      border: 2px solid #ddd;
-      border-radius: 8px;
-      font-size: 16px;
-      transition: border-color 0.3s;
-    }
-    input[type="text"]:focus {
-      outline: none;
-      border-color: #667eea;
-    }
-    .button-group {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-    button {
-      padding: 12px 24px;
-      border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      font-weight: bold;
-      cursor: pointer;
-      transition: all 0.3s;
-    }
-    .btn-send {
-      background: #667eea;
-      color: white;
-    }
-    .btn-send:hover {
-      background: #5568d3;
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-    }
-    .btn-reset {
-      background: #ff6b6b;
-      color: white;
-    }
-    .btn-reset:hover {
-      background: #ee5a52;
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(255, 107, 107, 0.4);
-    }
-    .status {
-      padding: 15px;
-      border-radius: 8px;
-      text-align: center;
-      font-weight: bold;
-      margin-top: 20px;
-    }
-    .status.connected {
-      background: #d4edda;
-      color: #155724;
-    }
-    .status.disconnected {
-      background: #f8d7da;
-      color: #721c24;
-    }
-  </style>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>WROVER Smart Monitor</title>
+    <style>
+        :root { --bg: #f0f2f5; --card: #ffffff; --text: #333; --cyan: #00d2d3; --teal: #0097a7; --blue: #2e86de; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); text-align: center; padding: 20px; }
+        .container { max-width: 400px; margin: auto; }
+        .card { background: var(--card); padding: 25px; border-radius: 20px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); margin-bottom: 20px; }
+        .progress-container { background: #eee; border-radius: 15px; height: 20px; width: 100%; margin: 20px 0; overflow: hidden; }
+        #progress-bar { height: 100%; width: 0%; transition: width 0.5s ease, background-color 0.5s ease; border-radius: 15px; }
+        .val-big { font-size: 3.5rem; font-weight: bold; margin: 10px 0; color: #444; }
+        .stats { display: flex; justify-content: space-around; border-top: 1px solid #eee; padding-top: 15px; }
+        input[type=text] { width: 100%; box-sizing: border-box; padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-bottom: 12px; font-size: 1rem; }
+        button { width: 100%; padding: 14px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; transition: 0.2s; font-size: 1rem; }
+        .btn-send { background: #007bff; color: white; margin-bottom: 10px; }
+        .btn-reset { background: #6c757d; color: white; }
+        #toast { visibility: hidden; background: #333; color: #fff; padding: 16px; position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%); border-radius: 50px; }
+        #toast.show { visibility: visible; animation: fade 0.5s; }
+    </style>
 </head>
 <body>
-  <div class="container">
-    <h1>🌡️ Humidity Monitor</h1>
-    
-    <div class="sensor-data">
-      <div class="data-card">
-        <div class="data-label">Current Humidity</div>
-        <div class="data-value" id="humidity">-<span class="unit">%</span></div>
-      </div>
-      <div class="data-card">
-        <div class="data-label">Max Humidity</div>
-        <div class="data-value" id="maxHumidity">-<span class="unit">%</span></div>
-      </div>
-      <div class="data-card">
-        <div class="data-label">Min Humidity</div>
-        <div class="data-value" id="minHumidity">-<span class="unit">%</span></div>
-      </div>
-      <div class="data-card">
-        <div class="data-label">Last Update</div>
-        <div id="lastUpdate" style="font-size: 14px; color: #666; margin-top: 5px;">Connecting...</div>
-      </div>
+    <div class="container">
+        <h1 style="color: #555;">Humidity Hub</h1>
+        <div class="card">
+            <div id="hum-val" class="val-big">--%</div>
+            <div class="progress-container"><div id="progress-bar"></div></div>
+            <div class="stats">
+                <div>Min: <b id="min-val">--</b>%</div>
+                <div>Max: <b id="max-val">--</b>%</div>
+            </div>
+        </div>
+        <div class="card">
+            <input type="text" id="msgInput" placeholder="LCD Message...">
+            <button class="btn-send" onclick="sendMsg()">Send Message</button>
+            <button class="btn-reset" onclick="resetValues()">Reset History</button>
+        </div>
     </div>
-
-    <div class="controls">
-      <label for="message" style="font-weight: bold; color: #333;">Send Message to LCD:</label>
-      <input type="text" id="message" placeholder="Enter message (max 20 chars)" maxlength="20">
-      <div class="button-group">
-        <button class="btn-send" onclick="sendMessage()">Send Message</button>
-        <button class="btn-reset" onclick="resetMinMax()">Reset Min/Max</button>
-      </div>
-    </div>
-
-    <div class="status" id="wifiStatus">Checking connection...</div>
-  </div>
-
-  <script>
-    function updateStatus() {
-      fetch('/status')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
-          document.getElementById('maxHumidity').textContent = data.maxHumidity.toFixed(1) + '%';
-          document.getElementById('minHumidity').textContent = data.minHumidity.toFixed(1) + '%';
-          
-          const now = new Date();
-          document.getElementById('lastUpdate').textContent = now.toLocaleTimeString();
-          
-          const wifiStatus = document.getElementById('wifiStatus');
-          if (data.wifiConnected) {
-            wifiStatus.textContent = '✓ WiFi Connected';
-            wifiStatus.className = 'status connected';
-          } else {
-            wifiStatus.textContent = '✗ WiFi Disconnected';
-            wifiStatus.className = 'status disconnected';
-          }
-        })
-        .catch(error => console.log('Error:', error));
-    }
-
-    function sendMessage() {
-      const message = document.getElementById('message').value;
-      if (message.trim() === '') {
-        alert('Enter message');
-        return;
-      }
-
-      fetch('/message', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'msg=' + encodeURIComponent(message)
-      })
-      .then(response => response.json())
-      .then(data => {
-        if (data.success) {
-          alert('Sent!');
-          document.getElementById('message').value = '';
+    <div id="toast">Sent!</div>
+    <script>
+        setInterval(fetchData, 3000);
+        function fetchData() {
+            fetch('/api/data').then(res => res.json()).then(data => {
+                document.getElementById('hum-val').innerText = data.curr + '%';
+                document.getElementById('min-val').innerText = data.min;
+                document.getElementById('max-val').innerText = data.max;
+                let bar = document.getElementById('progress-bar');
+                let val = data.curr;
+                bar.style.width = val + '%';
+                if(val < 35) bar.style.backgroundColor = 'var(--cyan)';
+                else if(val <= 65) bar.style.backgroundColor = 'var(--teal)';
+                else bar.style.backgroundColor = 'var(--blue)';
+            });
         }
-      })
-      .catch(error => console.log('Error:', error));
-    }
-
-    function resetMinMax() {
-      if (confirm('Reset min/max values?')) {
-        fetch('/reset', { method: 'POST' })
-          .then(response => response.json())
-          .then(data => {
-            if (data.success) {
-              alert('Reset!');
-              updateStatus();
-            }
-          })
-          .catch(error => console.log('Error:', error));
-      }
-    }
-
-    updateStatus();
-    setInterval(updateStatus, 2000);
-  </script>
+        function showToast(m) {
+            var x = document.getElementById("toast"); x.innerText = m; x.className = "show";
+            setTimeout(function(){ x.className = ""; }, 3000);
+        }
+        function sendMsg() {
+            let v = document.getElementById('msgInput').value;
+            if(!v) return;
+            fetch('/api/msg?val=' + encodeURIComponent(v)).then(() => {
+                showToast("Sent to LCD!"); document.getElementById('msgInput').value = "";
+            });
+        }
+        function resetValues() { fetch('/api/reset').then(() => showToast("History Reset!")); }
+    </script>
 </body>
 </html>
-  )=====" ;
-  
-  server.sendHeader("Content-Type", "text/html; charset=UTF-8");
-  server.send(200, "text/html", html);
+)=====";
+
+// --- HANDLERS ---
+void handleRoot() { 
+    Serial.println("[HTTP] Client requested Index Page");
+    server.send(200, "text/html", INDEX_HTML); 
 }
 
-void handleGetStatus(void) {
-  float h = sensorData.humidity;
-  float mn = sensorData.minHumidity;
-  float mx = sensorData.maxHumidity;
-  bool ok = uartRequestStatus(h, mn, mx);
-  
-  if (ok) {
-    sensorData.humidity = h;
-    sensorData.minHumidity = mn;
-    sensorData.maxHumidity = mx;
-  }
-  
-  String json = "{";
-  json += "\"humidity\":" + String(sensorData.humidity, 2) + ",";
-  json += "\"minHumidity\":" + String(sensorData.minHumidity, 2) + ",";
-  json += "\"maxHumidity\":" + String(sensorData.maxHumidity, 2) + ",";
-  json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
-  json += "\"nanoOk\":" + String(ok ? "true" : "false");
-  json += "}";
-  
-  server.sendHeader("Content-Type", "application/json");
-  server.send(200, "application/json", json);
+void handleGetData() {
+    String json = "{\"curr\":" + String(currentHum, 1) + ",\"min\":" + String(minHum, 1) + ",\"max\":" + String(maxHum, 1) + "}";
+    server.send(200, "application/json", json);
 }
 
-void handleReset(void) {
-  uartSendReset();
-  String json = "{\"success\":true}";
-  server.sendHeader("Content-Type", "application/json");
-  server.send(200, "application/json", json);
+void handleMsg() {
+    String val = server.arg("val");
+    Serial.printf("[HTTP] Sending message to Nano: %s\n", val.c_str());
+    Serial2.println("M:" + val); 
+    server.send(200, "text/plain", "OK");
 }
 
-void handleSendMessage(void) {
-  if (!server.hasArg("msg")) {
-    server.send(400, "application/json", "{\"success\":false}");
-    return;
-  }
-  
-  String message = server.arg("msg");
-  uartSendMessage(message);
-  
-  String json = "{\"success\":true}";
-  server.sendHeader("Content-Type", "application/json");
-  server.send(200, "application/json", json);
+void handleReset() {
+    Serial.println("[HTTP] Resetting Min/Max Command Received");
+    Serial2.println("R:1");
+    server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+    Serial.begin(MONITOR_BAUD);
+    Serial2.begin(NANO_BAUD, SERIAL_8N1, PIN_NANO_RX, PIN_NANO_TX); 
+    delay(2000); // Give power a moment to stabilize
+
+    Serial.println("\n\n[SYSTEM] Resetting WiFi Flash Settings...");
+    
+    // Explicitly clean up WiFi state
+    WiFi.disconnect(true); // Delete saved credentials
+    WiFi.mode(WIFI_STA);   // Set station mode explicitly
+    delay(100);
+
+    Serial.printf("[WiFi] Connecting to: %s ", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    
+    int attempt = 0;
+    while (WiFi.status() != WL_CONNECTED && attempt < 30) {
+        delay(500);
+        Serial.print(".");
+        attempt++;
+        
+        // If it hangs, try to re-trigger
+        if(attempt == 15) {
+            Serial.println("\n[WiFi] Retrying handshake...");
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+        }
+    }
+
+    if(WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[WiFi] Connected!");
+        Serial.printf("[WiFi] IP Address:  %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.printf("\n[ERROR] WiFi Failed. Status: %d\n", WiFi.status());
+    }
+
+    // Configure Server Handlers
+    server.on("/", handleRoot);
+    server.on("/api/data", handleGetData);
+    server.on("/api/msg", handleMsg);
+    server.on("/api/reset", handleReset);
+    
+    server.begin();
+    Serial.println("[HTTP] Server Ready.");
+}
+
+void loop() {
+    server.handleClient();
+
+    // Process UART Traffic
+    if (Serial2.available()) {
+        String incoming = Serial2.readStringUntil('\n');
+        incoming.trim();
+        
+        if (incoming.startsWith("H:")) {
+            int c1 = incoming.indexOf(',');
+            int c2 = incoming.indexOf(',', c1 + 1);
+            if (c1 != -1 && c2 != -1) {
+                currentHum = incoming.substring(2, c1).toFloat();
+                minHum = incoming.substring(c1 + 1, c2).toFloat();
+                maxHum = incoming.substring(c2 + 1).toFloat();
+                
+                // Keep the serial quiet but confirm data flow
+                Serial.printf("[UART] Update: %.1f%% (Min: %.1f Max: %.1f)\n", currentHum, minHum, maxHum);
+            }
+        }
+    }
 }
