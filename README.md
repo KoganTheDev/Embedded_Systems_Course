@@ -1,15 +1,14 @@
-# ☔ WROVER Humidity Hub & Gateway
-
-The **WROVER Humidity Hub** is a dual-processor IoT gateway that bridges local environmental sensing with a modern web interface. It utilizes an **Arduino Nano** for high-precision DHT11 sensor timing and an **ESP32 WROVER** to host an asynchronous web dashboard, providing real-time humidity tracking and remote hardware control.
+# ☔ IoT Humidity Gateway & Hub
+The **IoT Humidity Gateway & Hub** is a dual-processor embedded system that bridges local environmental sensing with a modern web interface. It utilizes an Arduino Nano for high-precision sensor timing and an ESP32 WROVER to host an asynchronous web dashboard, providing real-time humidity tracking and remote hardware control.
 
 ---
 
 ## 🧠 Overview
 
-This project implements a robust **UART-to-Web Gateway**. The system is split into two specialized modules to ensure high reliability and non-blocking performance:
+This project implements a robust **UART-to-Web Gateway**. By splitting the system into two specialized modules, it ensures high reliability and non-blocking performance:
 
-* **Local Node (Nano):** Dedicated to monitoring the DHT11 sensor and driving a 16x2 I2C LCD for local status.
-* **Network Gateway (ESP32):** Manages WiFi connectivity, serves a responsive HTML5/CSS3 dashboard, and handles remote API commands.
+* Local Node (Arduino Nano): Dedicated to high-frequency monitoring of the DHT11 sensor and driving a 16x2 I2C LCD for local status updates.
+* Network Gateway (ESP32): Manages WiFi connectivity, serves a responsive HTML5/CSS3 dashboard, and handles remote API commands via a RESTful approach.
 
 ---
 
